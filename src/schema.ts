@@ -11,7 +11,8 @@ export const SCHEMA_VERSION = 1;
  *    scans history. Both are written in one transaction, so they cannot
  *    disagree. An `asOf` in the past reads `node_versions` instead — the
  *    version current at that instant — which is why it carries the same
- *    kind/label indexes as `nodes`.
+ *    kind/label indexes as `nodes`. On Postgres the label indexes use hash:
+ *    labels are arbitrary-length notes, and the indexed predicate is =.
  *  - `edges` is append-only too. Retiring an edge is an UPDATE of two
  *    bookkeeping columns (`superseded_at`, `superseded_by`), never a DELETE,
  *    which is what makes `asOf` queries possible.
@@ -104,9 +105,9 @@ CREATE INDEX IF NOT EXISTS edges_dst         ON edges (dst);
 CREATE INDEX IF NOT EXISTS edges_rel         ON edges (rel);
 CREATE INDEX IF NOT EXISTS edges_recorded_at ON edges (recorded_at);
 CREATE INDEX IF NOT EXISTS nodes_kind        ON nodes (kind);
-CREATE INDEX IF NOT EXISTS nodes_label       ON nodes (label);
+CREATE INDEX IF NOT EXISTS nodes_label       ON nodes LABEL_INDEX_METHOD (label);
 CREATE INDEX IF NOT EXISTS node_versions_kind  ON node_versions (kind);
-CREATE INDEX IF NOT EXISTS node_versions_label ON node_versions (label);
+CREATE INDEX IF NOT EXISTS node_versions_label ON node_versions LABEL_INDEX_METHOD (label);
 `;
 
 /**
@@ -204,11 +205,13 @@ export function isMemoryPath(path: string): boolean {
  */
 export function renderSql(sql: string, dialect: Dialect, features: Partial<DriverFeatures> = {}): string {
   if (dialect === 'sqlite') {
-    return sql.replace(/\bEPOCH\b/g, 'INTEGER').replace(/\bVECTOR_TYPE\b/g, 'BLOB');
+    return sql.replace(/\bEPOCH\b/g, 'INTEGER').replace(/\bVECTOR_TYPE\b/g, 'BLOB')
+      .replace(/\bLABEL_INDEX_METHOD\b/g, '');
   }
   let out = sql
     .replace(/\bEPOCH\b/g, 'BIGINT')
     .replace(/\bVECTOR_TYPE\b/g, features.vector ? 'vector' : 'BYTEA')
+    .replace(/\bLABEL_INDEX_METHOD\b/g, 'USING hash')
     .replace(/\bREAL\b/g, 'DOUBLE PRECISION')
     .replace(/\bTEXT\b(?! COLLATE)/g, 'TEXT COLLATE "C"')
     .replace(/\binstr\(/g, 'strpos(')
@@ -238,6 +241,21 @@ export function renderSql(sql: string, dialect: Dialect, features: Partial<Drive
  */
 export async function initSchema(driver: Driver): Promise<void> {
   await driver.exec(DDL);
+  if (driver.dialect === 'postgres') {
+    // Older schemas have B-tree indexes under these names. They reject a
+    // valid long note label before the graph can record a completion. Replace
+    // each atomically; old readers also work with hash indexes, so this does
+    // not require a schema-version bump.
+    const labelIndexes = [{ name: 'nodes_label', table: 'nodes' },
+      { name: 'node_versions_label', table: 'node_versions' }] as const;
+    const rows = await driver.all(`SELECT indexname, indexdef FROM pg_indexes
+      WHERE schemaname = current_schema() AND indexname IN ('nodes_label', 'node_versions_label')`);
+    const methods = new Map(rows.map((row) => [String(row.indexname), String(row.indexdef)]));
+    for (const { name, table } of labelIndexes) {
+      if (/\bUSING hash\b/i.test(methods.get(name) ?? '')) continue;
+      await driver.transaction(() => driver.exec(`DROP INDEX IF EXISTS ${name}; CREATE INDEX ${name} ON ${table} USING hash (label)`));
+    }
+  }
   for (const table of Object.keys(COLUMNS) as TableName[]) {
     const actual = await driver.columns(table);
     const expected = [...COLUMNS[table]];
