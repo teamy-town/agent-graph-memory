@@ -32,8 +32,8 @@ import type {
  * node read in a query therefore goes through `nodeAt(id, q.asOf)`; with no
  * `asOf` that is the plain latest-version lookup.
  *
- * Everything here is asynchronous because the store is (see driver.ts). The
- * walk itself is unchanged: one `await` per frontier expansion.
+ * Everything here is asynchronous because the store is (see driver.ts).
+ * Frontier reads are batched; the walk settles nodes in the same heap order.
  */
 
 const DEFAULT_MAX_COST = 2;
@@ -66,7 +66,8 @@ async function resolveSeeds(
   // merely suspects exist ("the file this ticket will touch"), and a batch of
   // questions should not fail because one guess was wrong. The audit trail
   // (`seedSources`) shows what actually resolved.
-  for (const id of q.seeds ?? []) if (await ctx.store.nodeAt(id, q.asOf)) add(id, 'seed');
+  const explicit = await ctx.store.nodesAt(q.seeds ?? [], q.asOf);
+  for (const id of q.seeds ?? []) if (explicit.has(id)) add(id, 'seed');
 
   if (q.match) for (const n of await matchNodes(ctx, q.match, q.asOf)) add(n.id, 'match');
 
@@ -77,7 +78,8 @@ async function resolveSeeds(
     const ids = ctx.locator
       ? await ctx.locator.locate(q.locate, { limit })
       : await semanticLocate(ctx, q.locate, { limit, asOf: q.asOf });
-    for (const id of ids) if (await ctx.store.nodeAt(id, q.asOf)) add(id, 'locate');
+    const located = await ctx.store.nodesAt(ids, q.asOf);
+    for (const id of ids) if (located.has(id)) add(id, 'locate');
   }
 
   return { seeds: seedSources.map((s) => s.id), seedSources };
@@ -167,8 +169,8 @@ export function canonical(v: unknown): string {
 // Edge expansion: one statement per query, bound per frontier node.
 
 interface Expander {
-  /** Live edges incident on `node` under every filter, direction applied. */
-  edgesFrom(node: NodeId): Promise<EdgeRecord[]>;
+  /** Live edges for each frontier node under every filter, direction applied. */
+  edgesFrom(nodes: NodeId[]): Promise<Map<NodeId, EdgeRecord[]>>;
   /** Live edges under every filter whose BOTH endpoints are in `ids`. */
   edgesWithin(ids: NodeId[]): Promise<EdgeRecord[]>;
 }
@@ -214,23 +216,30 @@ function buildExpander(ctx: HandleContext, q: RecallQuery): Expander {
   // Direction is relative to the frontier node. Undirected edges are
   // traversable either way regardless of the requested direction.
   const direction = q.direction ?? 'both';
-  const incident =
-    direction === 'out'
-      ? '((directed = 1 AND src = ?) OR (directed = 0 AND (src = ? OR dst = ?)))'
-      : direction === 'in'
-        ? '((directed = 1 AND dst = ?) OR (directed = 0 AND (src = ? OR dst = ?)))'
-        : '(src = ? OR dst = ?)';
-  const incidentArity = direction === 'both' ? 2 : 3;
-
   const common = filters.join(' AND ');
   // Ordering by recorded_at makes tie-breaking deterministic without a sort
   // in JS: among equal-cost relaxations the earlier-recorded edge wins.
-  const perNode = `SELECT * FROM edges WHERE ${incident} AND ${common} ORDER BY recorded_at ASC, id ASC`;
-
   return {
-    async edgesFrom(node) {
-      const bind = incidentArity === 2 ? [node, node] : [node, node, node];
-      return (await ctx.store.driver.all(perNode, [...bind, ...params])).map(rowToEdge);
+    async edgesFrom(nodes) {
+      const out = new Map(nodes.map((id) => [id, [] as EdgeRecord[]]));
+      if (!nodes.length) return out;
+      const marks = placeholders(nodes.length);
+      const incident = direction === 'out'
+        ? `((directed = 1 AND src IN (${marks})) OR (directed = 0 AND (src IN (${marks}) OR dst IN (${marks}))))`
+        : direction === 'in'
+          ? `((directed = 1 AND dst IN (${marks})) OR (directed = 0 AND (src IN (${marks}) OR dst IN (${marks}))))`
+          : `(src IN (${marks}) OR dst IN (${marks}))`;
+      const bind = direction === 'both' ? [...nodes, ...nodes] : [...nodes, ...nodes, ...nodes];
+      const rows = await ctx.store.driver.all(
+        `SELECT * FROM edges WHERE ${incident} AND ${common} ORDER BY recorded_at ASC, id ASC`,
+        [...bind, ...params],
+      );
+      for (const row of rows) {
+        const edge = rowToEdge(row);
+        if (direction !== 'in' || !edge.directed) out.get(edge.src)?.push(edge);
+        if (edge.dst !== edge.src && (direction !== 'out' || !edge.directed)) out.get(edge.dst)?.push(edge);
+      }
+      return out;
     },
     async edgesWithin(ids) {
       if (ids.length === 0) return [];
@@ -272,6 +281,7 @@ interface HeapEntry {
 class MinHeap {
   private a: HeapEntry[] = [];
   get size(): number { return this.a.length; }
+  *nodes(): Iterable<NodeId> { for (const entry of this.a) yield entry.node; }
   push(e: HeapEntry): void {
     const a = this.a;
     a.push(e);
@@ -318,6 +328,23 @@ async function walk(expander: Expander, seeds: NodeId[], maxCost: number): Promi
   const done = new Set<NodeId>();
   const heap = new MinHeap();
   let seq = 0;
+  // Prefetch only nodes already on this walk's frontier. Relaxation still
+  // happens in the heap's exact order; no new node or edge is admitted here.
+  // A nonempty buffer is never topped up, bounding the lookahead to 128 nodes.
+  const buffered = new Map<NodeId, EdgeRecord[]>();
+  const edgesFrom = async (node: NodeId) => {
+    if (!buffered.has(node)) {
+      const batch = new Set([node]);
+      if (!buffered.size) for (const id of heap.nodes()) {
+        if (!done.has(id)) batch.add(id);
+        if (batch.size >= 128) break;
+      }
+      for (const [id, edges] of await expander.edgesFrom([...batch])) buffered.set(id, edges);
+    }
+    const edges = buffered.get(node)!;
+    buffered.delete(node);
+    return edges;
+  };
 
   for (const s of seeds) {
     best.set(s, { cost: 0, seed: s });
@@ -331,7 +358,7 @@ async function walk(expander: Expander, seeds: NodeId[], maxCost: number): Promi
     if (settled.cost !== cur.cost) continue; // stale entry
     done.add(cur.node);
 
-    for (const e of await expander.edgesFrom(cur.node)) {
+    for (const e of await edgesFrom(cur.node)) {
       const next = e.src === cur.node ? e.dst : e.src;
       if (next === cur.node) continue; // self-loop: nothing to reach
       const cost = settled.cost + e.cost;
@@ -373,11 +400,12 @@ export async function recall(ctx: HandleContext, q: RecallQuery): Promise<Recall
   const kinds = q.kinds ? new Set(q.kinds) : undefined;
 
   let hits: RecallHit[] = [];
+  const reached = await ctx.store.nodesAt([...best.keys()].filter((id) => !seedSet.has(id) || q.includeSeeds), q.asOf);
   for (const [id, s] of best) {
     if (seedSet.has(id) && !q.includeSeeds) continue;
     // Absent only when the node's first version postdates asOf (an edge can
     // be back-filled earlier than its endpoint): it did not exist then.
-    const node = await ctx.store.nodeAt(id, q.asOf);
+    const node = reached.get(id);
     if (!node) continue;
     if (kinds && !kinds.has(node.kind)) continue;
     hits.push({ node, cost: s.cost, path: pathTo(best, id), seed: s.seed });

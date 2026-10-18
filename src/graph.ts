@@ -102,6 +102,26 @@ export class Store {
     return r ? rowToNode(r) : undefined;
   }
 
+  /** The same version rule as nodeAt, in bounded primary-key batches. */
+  async nodesAt(ids: NodeId[], asOf: number | undefined): Promise<Map<NodeId, NodeRecord>> {
+    const out = new Map<NodeId, NodeRecord>();
+    const unique = [...new Set(ids)];
+    for (let i = 0; i < unique.length; i += 500) {
+      const batch = unique.slice(i, i + 500);
+      const marks = batch.map(() => '?').join(', ');
+      const rows = asOf === undefined
+        ? await this.driver.all(`SELECT * FROM nodes WHERE id IN (${marks})`, batch)
+        : await this.driver.all(
+          `SELECT v.*, n.created_by, n.created_at FROM node_versions v JOIN nodes n ON n.id = v.id
+           WHERE v.id IN (${marks}) AND v.recorded_at <= ?
+           AND v.version = (SELECT MAX(w.version) FROM node_versions w WHERE w.id = v.id AND w.recorded_at <= ?)`,
+          [...batch, asOf, asOf],
+        );
+      for (const row of rows) { const node = rowToNode(row); out.set(node.id, node); }
+    }
+    return out;
+  }
+
   /** One specific version, or undefined. */
   async version(id: NodeId, version: number): Promise<NodeRecord | undefined> {
     const r = await this.one(
