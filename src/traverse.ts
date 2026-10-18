@@ -480,8 +480,9 @@ export async function subgraph(ctx: HandleContext, q: RecallQuery): Promise<Subg
   const seedSet = new Set(seeds);
 
   let nodes: Array<{ node: NodeRecord; cost: number }> = [];
+  const versions = await ctx.store.nodesAt([...best.keys()], q.asOf);
   for (const [id, s] of best) {
-    const node = await ctx.store.nodeAt(id, q.asOf);
+    const node = versions.get(id);
     if (!node) continue;
     // `kinds` shapes what is returned around the seeds; the seeds themselves
     // are the centre of the picture and stay whatever their kind.

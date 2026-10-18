@@ -30,3 +30,26 @@ test('a wide recall batches database reads without changing paths or the returne
     assert.ok(calls <= 12, `wide recall made ${calls} database round trips`);
   } finally { await g.close(); }
 });
+
+test('a wide subgraph batches node versions and retains every induced edge', async () => {
+  const g = await openGraph(':memory:', { origin: 'test', trusted: true });
+  try {
+    await g.put({ id: 's', kind: 'seed', label: 'seed', provenance: 'observed' });
+    for (let i = 0; i < 64; i++) {
+      const id = `leaf:${i}`;
+      await g.put({ id, kind: 'leaf', label: id, provenance: 'observed' });
+      await g.link({ src: 's', dst: id, rel: 'about', cost: 1, provenance: 'observed' });
+    }
+    const original = SqliteDriver.prototype.all;
+    let calls = 0;
+    SqliteDriver.prototype.all = function (...args) { calls++; return original.apply(this, args); };
+    let r;
+    try { r = await g.subgraph({ seeds: ['s', 'missing'], maxCost: 1, limit: 64, direction: 'out' }); }
+    finally { SqliteDriver.prototype.all = original; }
+    assert.equal(r.nodes.length, 65, 'the seed is exempt from the result limit');
+    assert.equal(r.edges.length, 64);
+    assert.deepEqual(r.seeds, ['s']);
+    assert.equal(r.truncated, false);
+    assert.ok(calls <= 12, `wide subgraph made ${calls} database round trips`);
+  } finally { await g.close(); }
+});
