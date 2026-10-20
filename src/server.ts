@@ -40,6 +40,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openAiCompatibleEmbedder, textRuleFrom, type TextRuleSpec } from './embedding.js';
+import { withSignal } from './driver.js';
 import { dropGraph, openGraph } from './graph.js';
 import { errorToJson, packageVersion, UsageError } from './surface.js';
 import { findTool } from './tools.js';
@@ -49,6 +50,8 @@ import { validateArgs } from './validate.js';
 
 export const GRAPH_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
 const MAX_BODY = 16 * 1024 * 1024;
+/** A request at least this long is logged (op, graph, milliseconds). */
+const SLOW_REQUEST_MS = 1000;
 /** Separator inside a cache key; cannot occur in a graph id. */
 const KEY_SEP = '|';
 
@@ -203,12 +206,26 @@ export class GraphServer {
       return;
     }
     const op = m[1];
+    // The caller's signal: aborted when the connection closes before the
+    // answer was written (driver.ts withSignal). Work it still had queued on
+    // the graph's connection is not run.
+    const caller = new AbortController();
+    res.on('close', () => { if (!res.writableFinished) caller.abort(); });
+    const started = Date.now();
+    let graphId = '';
     try {
       const body = await readJson(req);
-      send(res, 200, await this.dispatch(op, body));
+      graphId = typeof body.graphId === 'string' ? body.graphId : '';
+      const out = await withSignal(caller.signal, () => this.dispatch(op, body));
+      send(res, 200, out);
     } catch (err) {
-      send(res, statusOf(err), { error: errorToJson(err) });
+      if (!caller.signal.aborted) send(res, statusOf(err), { error: errorToJson(err) });
     }
+    // One line per request that took a second or more, or whose caller left:
+    // the queue on a graph is otherwise invisible from outside.
+    const ms = Date.now() - started;
+    if (caller.signal.aborted) this.log(`${op} ${graphId}: the caller left after ${ms}ms; the rest was not run`);
+    else if (ms >= SLOW_REQUEST_MS) this.log(`${op} ${graphId}: ${ms}ms`);
   }
 
   private async dispatch(op: string, body: Record<string, unknown>): Promise<unknown> {

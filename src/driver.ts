@@ -64,6 +64,36 @@ export interface Driver {
 }
 
 /**
+ * THE CALLER'S SIGNAL. A request whose caller has gone (a timeout on the far
+ * side, a closed connection) is answered by nobody, yet every statement it
+ * still has to run would hold the connection — and every request queued
+ * behind it on the same graph waits for work whose answer is thrown away. A
+ * caller that gave up and asked again doubled the queue. `withSignal` scopes
+ * a signal to everything run inside it (async context, like the transaction
+ * holder below); `Serializer.exclusive` stops such work when it next asks for
+ * the connection. A transaction that has begun is never cut: its statements
+ * pass straight through, so it commits or rolls back whole.
+ */
+const callerScope = new AsyncLocalStorage<AbortSignal>();
+
+/** Run `fn` with `signal` as the caller's signal for every statement it issues. */
+export function withSignal<T>(signal: AbortSignal, fn: () => Promise<T>): Promise<T> {
+  return callerScope.run(signal, fn);
+}
+
+/** The caller left before this work reached the connection. */
+export class CallerGoneError extends Error {
+  constructor() {
+    super('the caller is gone; the rest of this request was not run');
+    this.name = 'CallerGoneError';
+  }
+}
+
+function throwIfCallerGone(): void {
+  if (callerScope.getStore()?.aborted) throw new CallerGoneError();
+}
+
+/**
  * One connection, one caller at a time. `exclusive(fn)` queues `fn` behind
  * whatever holds the connection; a call made from inside the holder's own
  * async context (its transaction body) passes straight through, which is how
@@ -84,6 +114,7 @@ export class Serializer {
   async exclusive<T>(fn: () => MaybePromise<T>): Promise<T> {
     const ctx = this.context.getStore();
     if (ctx !== undefined && ctx === this.holder) return fn();
+    throwIfCallerGone();
     let release!: () => void;
     const prev = this.tail;
     this.tail = new Promise<void>((r) => (release = r));
@@ -91,6 +122,7 @@ export class Serializer {
     const token = {};
     this.holder = token;
     try {
+      throwIfCallerGone();
       return await this.context.run(token, fn);
     } finally {
       this.holder = undefined;

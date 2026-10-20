@@ -281,7 +281,7 @@ interface HeapEntry {
 class MinHeap {
   private a: HeapEntry[] = [];
   get size(): number { return this.a.length; }
-  *nodes(): Iterable<NodeId> { for (const entry of this.a) yield entry.node; }
+  *entries(): Iterable<HeapEntry> { yield* this.a; }
   push(e: HeapEntry): void {
     const a = this.a;
     a.push(e);
@@ -330,14 +330,18 @@ async function walk(expander: Expander, seeds: NodeId[], maxCost: number): Promi
   let seq = 0;
   // Prefetch only nodes already on this walk's frontier. Relaxation still
   // happens in the heap's exact order; no new node or edge is admitted here.
-  // A nonempty buffer is never topped up, bounding the lookahead to 128 nodes.
+  // Each read takes up to 128 frontier nodes that are not buffered yet (the
+  // heap's array order is not its pop order, so a buffer that was never topped
+  // up fell back to one read per node), and at most 1024 nodes' edges are held
+  // at once. A node whose cost has reached the budget is never read (see
+  // below), so it is never prefetched either.
   const buffered = new Map<NodeId, EdgeRecord[]>();
   const edgesFrom = async (node: NodeId) => {
     if (!buffered.has(node)) {
       const batch = new Set([node]);
-      if (!buffered.size) for (const id of heap.nodes()) {
-        if (!done.has(id)) batch.add(id);
-        if (batch.size >= 128) break;
+      for (const entry of heap.entries()) {
+        if (batch.size >= 128 || buffered.size + batch.size >= 1024) break;
+        if (!done.has(entry.node) && !buffered.has(entry.node) && entry.cost < maxCost) batch.add(entry.node);
       }
       for (const [id, edges] of await expander.edgesFrom([...batch])) buffered.set(id, edges);
     }
@@ -357,6 +361,12 @@ async function walk(expander: Expander, seeds: NodeId[], maxCost: number): Promi
     const settled = best.get(cur.node)!;
     if (settled.cost !== cur.cost) continue; // stale entry
     done.add(cur.node);
+    // Every edge costs more than 0 (Graph.link refuses anything else), so a
+    // node already at the budget reaches nothing new: reading its edges only
+    // to drop every one of them is the whole cost of a wide recall — with
+    // maxCost 1, every node a seed reaches is such a node, and a hub among
+    // them returns hundreds of rows that are all discarded.
+    if (!(settled.cost < maxCost)) continue;
 
     for (const e of await edgesFrom(cur.node)) {
       const next = e.src === cur.node ? e.dst : e.src;
