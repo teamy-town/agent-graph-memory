@@ -1,6 +1,6 @@
 {
   "name": "@zibby/agent-graph-memory",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A growable, time-aware memory graph for AI agents. SQLite by default (zero runtime dependencies), Postgres optionally, configurable embeddings. JS API, CLI, MCP server, HTTP server.",
   "license": "MIT",
   "type": "module",

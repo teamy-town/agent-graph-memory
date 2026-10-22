@@ -243,6 +243,7 @@ agent-graph-server --driver postgres --pg postgres://user:pw@db/app [--port …]
 
 ## Changelog
 
+- **0.2.1** — Faster recall and subgraph reads: frontier and node-version reads are batched, a node at its budget no longer has its edges read, and work stops when the caller has gone. Postgres: a new graph indexes labels by hash, so a label longer than a btree index row no longer fails the write (an existing graph keeps the indexes it was created with).
 - **0.2.0** — Storage is a driver: SQLite (default) or Postgres (`pg`, optional). **Every `Graph` method is now `async`** and `openGraph()` returns a Promise; each write is one transaction. Configurable embeddings (`embedding` option, `reembed()`, `recall({ locate })`, `match({ semantic })`, `openAiCompatibleEmbedder`). `agent-graph-server` HTTP sidecar. `dropGraph()`, `renderSql()`, `journalToSql(op, dialect)`.
 - **0.1.0** — First release: SQLite, JS API, CLI, MCP server, journal/replay, dump/load.
 
