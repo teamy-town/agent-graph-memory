@@ -61,6 +61,17 @@ export function checkContent(text: string): GuardReport {
  *  absent; objects (attrs) are scanned as the JSON that will be stored. */
 export type GuardFields = Record<string, string | number | boolean | Record<string, unknown> | null | undefined>;
 
+/** The path of the first string in `value` that the guard refuses: names only, never the value. */
+function offendingPath(value: unknown, path = ''): string | null {
+  if (typeof value === 'string') return checkContent(value).rejected ? path : null;
+  if (value === null || typeof value !== 'object') return null;
+  for (const [k, v] of Object.entries(value)) {
+    const found = offendingPath(v, path ? `${path}.${k}` : k);
+    if (found !== null) return found;
+  }
+  return null;
+}
+
 /**
  * Guard a write. Returns the flags to store on the record (the union over
  * every field), or throws `GuardError` naming the offending FIELD before
@@ -75,7 +86,8 @@ export function guardFields(op: string, fields: GuardFields): string[] {
       // "(github token)" tells the writer what to strip; the value itself is
       // exactly what must not appear here.
       const cls = report.reason?.replace(/^credential-shaped value /, '') ?? '';
-      throw new GuardError(`${op}: ${field} looks like a credential ${cls}`.trimEnd(), { ...report, field });
+      const where = typeof value === 'object' ? offendingPath(value) : null;
+      throw new GuardError(`${op}: ${field}${where ? `.${where}` : ''} looks like a credential ${cls}`.trimEnd(), { ...report, field });
     }
     for (const f of report.flags) flags.add(f);
   }

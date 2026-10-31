@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { checkContent } from '../src/guards.js';
+import { checkContent, guardFields } from '../src/guards.js';
 
 const long = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890';
 
@@ -16,4 +16,13 @@ test('an openai-style key is still refused wherever it sits', () => {
     assert.equal(report.rejected, true, text);
     assert.match(report.reason ?? '', /openai-style key/);
   }
+});
+
+test('a refused attribute is named by its path, and its value stays out of the message', () => {
+  const key = `sk-${long}`;
+  assert.throws(() => guardFields('link', { attrs: { exec: 'x', limits: ['fine', { text: key }] } }), (err: Error) => {
+    assert.match(err.message, /attrs\.limits\.1\.text looks like a credential/);
+    assert.ok(!err.message.includes(key));
+    return true;
+  });
 });
