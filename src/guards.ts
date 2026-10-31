@@ -24,7 +24,9 @@ import { GuardError, type GuardReport } from './types.js';
 /** Each pattern is anchored to a well-known credential shape, not to the
  *  word "secret" — a value that merely mentions secrets is fine. */
 const CREDENTIAL_PATTERNS: Array<{ name: string; re: RegExp }> = [
-  { name: 'openai-style key', re: /(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}/ },
+  // A real key holds a random token: 8+ characters with a digit. Words joined by
+  // hyphens (`sk-range-on-the-partition-key`) hold none.
+  { name: 'openai-style key', re: /(?<![A-Za-z0-9])sk-(?=(?:[A-Za-z0-9_-]*-)?(?=[A-Za-z_]*[0-9])[A-Za-z0-9_]{8})[A-Za-z0-9_-]{20,}/ },
   { name: 'github token', re: /gh[pousr]_[A-Za-z0-9]{30,}/ },
   { name: 'gitlab token', re: /glpat-[A-Za-z0-9_-]{20,}/ },
   { name: 'slack token', re: /xox[baprs]-[A-Za-z0-9-]{10,}/ },
