@@ -13,7 +13,7 @@
  *
  * `<op>` is a tools.ts tool name without its `graph_` prefix (put, link,
  * supersede, match, get, recall, recall_many, subgraph, trace, trace_edge,
- * stats, reembed), plus `drop` (delete the graph's file/schema; needs
+ * stats, reembed, compact_vectors), plus `drop` (delete the graph's file/schema; needs
  * `confirm: true`). The body is an ENVELOPE around the tool's arguments:
  *
  *   { graphId, origin?, trusted?, privileged?, readOnly?, embedding?, ...toolArgs }
@@ -385,7 +385,7 @@ export function usage(): string {
     'Routes:',
     '  GET  /health          { ok, driver, version }',
     '  POST /graph/<op>      body { graphId, origin?, trusted?, privileged?, readOnly?, embedding?, ...toolArgs }',
-    '                        <op>: put link supersede match get recall recall_many subgraph trace trace_edge stats reembed drop',
+    '                        <op>: put link supersede match get recall recall_many subgraph trace trace_edge stats reembed compact_vectors drop',
     '',
     'graphId selects the SQLite file (<dir>/<graphId>.sqlite) or the Postgres schema; the caller derives it.',
     'embedding: { baseUrl, apiKey?, model, dims, text?: "label" | "label+attrs" | { attrs: [...] }, kinds?, maxChars? } per request.',

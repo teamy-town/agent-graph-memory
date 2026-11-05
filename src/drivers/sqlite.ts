@@ -46,6 +46,16 @@ export class SqliteDriver implements Driver {
     return this.gate.exclusive(() => this.statement(sql).all(...params) as SqlRow[]);
   }
 
+  /** Rows one at a time (`StatementSync.iterate`), holding the connection
+   *  for the whole scan like any other statement. */
+  each(sql: string, params: SqlParam[], onRow: (row: SqlRow) => void): Promise<void> {
+    return this.gate.exclusive(() => {
+      const st = this.statement(sql) as StatementSync & { iterate?: (...p: SqlParam[]) => Iterable<unknown> };
+      const rows = typeof st.iterate === 'function' ? st.iterate(...params) : st.all(...params);
+      for (const r of rows) onRow(r as SqlRow);
+    });
+  }
+
   run(sql: string, params: SqlParam[] = []): Promise<{ changes: number }> {
     return this.gate.exclusive(() => ({ changes: Number(this.statement(sql).run(...params).changes) }));
   }

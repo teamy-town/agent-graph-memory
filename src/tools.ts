@@ -465,6 +465,17 @@ const definitions: ToolDefinition[] = [
       return graph.reembed(args as Parameters<Graph['reembed']>[0]);
     },
   },
+  {
+    name: 'graph_compact_vectors',
+    readOnly: false,
+    description:
+      'Bring the stored embedding vectors in line with the graph\'s current embedding rule WITHOUT calling the model: removes the vector of every node the rule now excludes (e.g. a kind no longer listed) and rewrites older float32 vectors in the compact int8 form. ' +
+      'Never recomputes a vector (that is graph_reembed). Only available when the graph was opened with an embedding model (for the rule). Returns { kept, converted, cleared }.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    run(graph) {
+      return graph.compactVectors();
+    },
+  },
 ];
 
 /**

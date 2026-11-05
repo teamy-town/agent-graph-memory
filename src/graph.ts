@@ -1,7 +1,7 @@
 import type { Driver, SqlParam } from './driver.js';
 import { PostgresDriver } from './drivers/postgres.js';
 import { SqliteDriver } from './drivers/sqlite.js';
-import { embedNodes, reembed as reembedNodes } from './embedding.js';
+import { compactVectors as compactStoredVectors, embedNodes, reembed as reembedNodes } from './embedding.js';
 import { guardFields } from './guards.js';
 import { newEdgeId } from './ids.js';
 import {
@@ -43,6 +43,7 @@ import {
   type RecallResult,
   type ReembedOptions,
   type ReembedResult,
+  type CompactVectorsResult,
   type Row,
   type SqlStatement,
   type Subgraph,
@@ -625,6 +626,11 @@ class GraphHandle implements Graph {
     // Vectors are derived, but writing them is still writing.
     this.assertWritable('reembed');
     return reembedNodes(this.ctx(), opts);
+  }
+
+  async compactVectors(): Promise<CompactVectorsResult> {
+    this.assertWritable('compactVectors');
+    return compactStoredVectors(this.ctx());
   }
 
   // -- housekeeping ---------------------------------------------------------

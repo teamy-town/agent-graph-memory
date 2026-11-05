@@ -161,6 +161,25 @@ export function embeddingSuite(h: Harness): void {
       await assert.rejects(plain.reembed(), /no embedding configured/);
     });
 
+    test('compactVectors: drops the vectors of kinds the rule no longer lists, with no model call', async () => {
+      const emb = fakeEmbedder();
+      const g = await h.open({ origin: 'rt', trusted: true, embedding: emb });
+      await g.put({ id: 'n:1', kind: 'note', label: 'pricing rounding rule' });
+      await g.put({ id: 'f:1', kind: 'file', label: 'src/pricing.ts' });
+      await g.put({ id: 'r:1', kind: 'run', label: 'manager round 1' });
+      const calls = emb.calls.length;
+      const narrowed = g.as('rt', { embedding: { ...emb, kinds: ['note'] } });
+      const res = await narrowed.compactVectors();
+      assert.equal(res.cleared, 2);
+      assert.equal(res.kept + res.converted, 1);
+      assert.equal(emb.calls.length, calls, 'no model call');
+      assert.deepEqual((await vectors(narrowed)).map((v) => v.id), ['n:1']);
+      assert.deepEqual((await narrowed.match({ semantic: 'pricing rounding' })).map((n) => n.id), ['n:1'], 'the kept vector still ranks');
+      assert.deepEqual(await narrowed.compactVectors(), { kept: 1, converted: 0, cleared: 0 }, 'idempotent');
+      const plain = await h.open({ origin: 'rt', trusted: true });
+      await assert.rejects(plain.compactVectors(), /no embedding configured/);
+    });
+
     test('vectors are derived: not in a dump, rebuilt by reembed on the copy', async () => {
       const emb = fakeEmbedder();
       const g = await h.open({ origin: 'rt', privileged: true, embedding: emb });

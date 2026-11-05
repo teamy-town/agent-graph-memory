@@ -50,6 +50,10 @@ export interface Driver {
   exec(sql: string): MaybePromise<void>;
   all(sql: string, params?: SqlParam[]): MaybePromise<SqlRow[]>;
   run(sql: string, params?: SqlParam[]): MaybePromise<{ changes: number }>;
+  /** Optional: hand each row of a read to `onRow` as the engine yields it,
+   *  so a scan over many rows (the vector search) never holds them all.
+   *  A driver without it is read through `all`. */
+  each?(sql: string, params: SqlParam[], onRow: (row: SqlRow) => void): MaybePromise<void>;
   /** Run `fn` atomically with exclusive use of the connection. Nested calls
    *  join the outer transaction (no savepoints — every public write is one
    *  unit and the inner call only exists for code sharing). */

@@ -337,6 +337,16 @@ export interface ReembedOptions {
   since?: number;
 }
 
+/** What `compactVectors()` did — no model was called. */
+export interface CompactVectorsResult {
+  /** Vectors left as they were (already compact, or pgvector's own type). */
+  kept: number;
+  /** float32 BLOBs rewritten as int8 (same version, same dims). */
+  converted: number;
+  /** Vectors removed because the rule now returns null for the node. */
+  cleared: number;
+}
+
 export interface ReembedResult {
   /** Vectors written. */
   embedded: number;
@@ -497,6 +507,13 @@ export interface Graph {
    *  nodes (latest versions): the way to change WHAT is embedded after the
    *  fact. Needs a writable handle with `embedding` configured. */
   reembed(opts?: ReembedOptions): Promise<ReembedResult>;
+
+  /** Bring the STORED vectors in line with the current rule without calling
+   *  the model: remove the vector of every node the rule now excludes (a kind
+   *  no longer listed), and rewrite a float32 BLOB written before int8 as
+   *  int8. A vector the rule keeps is never recomputed — that is `reembed`.
+   *  Needs a writable handle with `embedding` configured (for the rule). */
+  compactVectors(): Promise<CompactVectorsResult>;
 
   /** A handle over the same database that can only NARROW this one: read-only
    *  is inherited and cannot be cleared; `privileged` needs a privileged

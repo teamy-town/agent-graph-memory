@@ -172,7 +172,7 @@ The store speaks one dialect of SQL and hands every statement to a **driver**; t
 | Open | `openGraph('./memory.sqlite')` or `':memory:'` | `openGraph({ driver: 'postgres', connectionString, schema })` |
 | Dependencies | none (`node:sqlite`) | the `pg` package, an optional peer dependency loaded only when used |
 | Unit of a graph | one file | one **schema** (`CREATE SCHEMA IF NOT EXISTS`, then `search_path`) — the tenancy unit; `dropGraph(target)` drops it |
-| Embeddings | float32 blobs, cosine in JS | pgvector `vector` + `<=>` when the extension is available, BYTEA + JS cosine otherwise |
+| Embeddings | int8 blobs, cosine in JS | pgvector `vector` + `<=>` when the extension is available, int8 BYTEA + JS cosine otherwise |
 | Concurrency | one connection, statements serialised; each write is one transaction | one `pg.Client` per graph, same rules |
 
 ```js
@@ -209,7 +209,8 @@ const g = await openGraph('./memory.sqlite', {
 - `put()` embeds the new version after it commits. A failed model call is logged and **never fails the write**: a model that is down loses a vector, not a fact.
 - `recall({ locate: 'rounding rule in pricing' })` and `match({ semantic: '…', kind: 'note' })` search by similarity; the query text goes through the same `embed`. `asOf` still applies (a node that did not exist then cannot be found). A host-supplied `Locator` takes precedence over the built-in search when both are configured.
 - `reembed({ kinds?, since? })` recomputes vectors under the current rule — the way to change *what* is embedded after the fact, or to backfill nodes written before embeddings were on. Nodes the rule now excludes have their vector removed.
-- Storage is one row per node in `node_vectors`, the vector of the version it was computed from. SQLite: brute-force cosine over the stored vectors of the requested kinds (fine at the sizes an agent memory reaches). Postgres with pgvector: `ORDER BY embedding <=> $q LIMIT k`.
+- `compactVectors()` brings the stored vectors in line with the current rule **without calling the model**: a node the rule now excludes (a kind you stopped listing) loses its vector, and a float32 blob written by an older version is rewritten as int8. Narrowing `kinds` on a big graph therefore costs nothing: change the rule, then compact.
+- Storage is one row per node in `node_vectors`, the vector of the version it was computed from. SQLite (and Postgres without pgvector): int8 — one byte per dimension plus a float32 scale, a quarter of float32. On a real 15.6k-vector agent memory (OpenAI `text-embedding-3-small`, 1536 dims, 200 queries) its top-10 agreed with float32's on 99.6% of results; cutting dimensions to 512 for a similar saving agreed on 73%. Older float32 blobs are still read (told apart by length). The search reads each blob through a typed-array view and keeps a running top-k, so a query holds k candidates rather than every vector: brute-force cosine over the stored vectors of the requested kinds (fine at the sizes an agent memory reaches). Postgres with pgvector: `ORDER BY embedding <=> $q LIMIT k`.
 - `openAiCompatibleEmbedder({ baseUrl, apiKey?, model, dims })` is the one built-in provider: a POST to `/v1/embeddings`, no SDK. It refuses a response whose dimension is not `dims`, so a misconfigured model cannot fill the table with incomparable rows. Any `{ embed(texts) => Promise<number[][]>, dims }` works in its place.
 
 ## Server mode
@@ -226,7 +227,7 @@ agent-graph-server --driver postgres --pg postgres://user:pw@db/app [--port …]
 | `GET /health` | — | `{ ok: true, driver, version }` |
 | `POST /graph/<op>` | `{ graphId, origin?, trusted?, privileged?, readOnly?, embedding?, ...toolArgs }` | the tool result as JSON |
 
-`<op>` is a tool name without its `graph_` prefix: `put`, `link`, `supersede`, `match`, `get`, `recall`, `recall_many`, `subgraph`, `trace`, `trace_edge`, `stats`, `reembed`, plus `drop` (deletes the graph's file or schema; requires `confirm: true`). The tool arguments are validated by the same schema the CLI and MCP server use — there is one definition of the tool surface.
+`<op>` is a tool name without its `graph_` prefix: `put`, `link`, `supersede`, `match`, `get`, `recall`, `recall_many`, `subgraph`, `trace`, `trace_edge`, `stats`, `reembed`, `compact_vectors`, plus `drop` (deletes the graph's file or schema; requires `confirm: true`). The tool arguments are validated by the same schema the CLI and MCP server use — there is one definition of the tool surface.
 
 - **`graphId`** (required, `^[A-Za-z0-9_.:-]{1,128}$`) selects the storage: `<dir>/<graphId>.sqlite`, or the Postgres schema named after it (ids longer than 63 bytes get a prefix + hash). The server does not know whose graph it is — the caller derived the id and is trusted to have done so.
 - **`origin`** names the writer. A write without one is refused (400); a read needs none.
@@ -243,6 +244,7 @@ agent-graph-server --driver postgres --pg postgres://user:pw@db/app [--port …]
 
 ## Changelog
 
+- **Unreleased** — Vectors on SQLite (and Postgres without pgvector) are stored as int8, a quarter of float32; float32 blobs written before are still read. `compactVectors()` / `compact_vectors` removes the vectors of kinds the rule no longer lists and converts old float32 blobs, with no model call. The SQLite search computes cosine on a typed-array view of each blob and streams rows into a top-k list: on a 31k-vector copy of a real agent memory, `recall({ locate })` went from 1546 ms to 313 ms (float32 blobs) and to 121 ms once the graph keeps 15.6k int8 vectors.
 - **0.2.1** — Faster recall and subgraph reads: frontier and node-version reads are batched, a node at its budget no longer has its edges read, and work stops when the caller has gone. Postgres: a new graph indexes labels by hash, so a label longer than a btree index row no longer fails the write (an existing graph keeps the indexes it was created with).
 - **0.2.0** — Storage is a driver: SQLite (default) or Postgres (`pg`, optional). **Every `Graph` method is now `async`** and `openGraph()` returns a Promise; each write is one transaction. Configurable embeddings (`embedding` option, `reembed()`, `recall({ locate })`, `match({ semantic })`, `openAiCompatibleEmbedder`). `agent-graph-server` HTTP sidecar. `dropGraph()`, `renderSql()`, `journalToSql(op, dialect)`.
 - **0.1.0** — First release: SQLite, JS API, CLI, MCP server, journal/replay, dump/load.
