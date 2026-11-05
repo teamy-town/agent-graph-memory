@@ -5,6 +5,18 @@
  *
  *   agent-graph-server --driver sqlite   --sqlite-dir <dir> [--port 8787] [--host 127.0.0.1] [--auth-token <t>]
  *   agent-graph-server --driver postgres --pg <connectionString> [...]
+ *   agent-graph-server --driver sqlite   --sqlite-dir <dir> --migrate-from-pg <connectionString> [...]
+ *
+ * MOVING OFF POSTGRES (`--migrate-from-pg`, SQLite driver only): a graph whose
+ * file does not exist yet is copied from the Postgres schema the same graph id
+ * had (`schemaFor`) the first time it is opened — this server is the one place
+ * that knows the id behind a schema name shortened with a hash. The copy is
+ * verified table by table before the file appears (migrate.ts). If it fails
+ * the graph is served from its Postgres schema for the life of the process and
+ * the log says so; the move is tried again on the next start. The schema is
+ * never modified. `--list-unmigrated` prints the schemas that still hold rows
+ * no file has taken over (JSON array) and exits — empty means the Postgres
+ * server is no longer needed.
  *
  * Contract (fixed — a platform is built against it):
  *
@@ -35,7 +47,7 @@
  */
 
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { realpathSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -43,6 +55,7 @@ import { openAiCompatibleEmbedder, textRuleFrom, type TextRuleSpec } from './emb
 import { withSignal } from './driver.js';
 import { dropGraph, openGraph } from './graph.js';
 import { errorToJson, packageVersion, UsageError } from './surface.js';
+import { markDropped, migrateSchemaToSqlite, unmigratedSchemas } from './migrate.js';
 import { findTool } from './tools.js';
 import { canonical } from './traverse.js';
 import { ValidationError, type EmbeddingConfig, type Graph, type JsonSchema, type OpenTarget } from './types.js';
@@ -61,6 +74,8 @@ export interface ServerOptions {
   sqliteDir?: string;
   /** postgres: connection string; one schema per graph. */
   pg?: string;
+  /** sqlite only: copy a graph from this Postgres on its first open (see top). */
+  migrateFromPg?: string;
   authToken?: string;
   log?: (line: string) => void;
 }
@@ -145,11 +160,14 @@ class HttpError extends Error {
 export class GraphServer {
   readonly http: Server;
   private readonly graphs = new Map<string, Promise<Graph>>();
+  /** --migrate-from-pg: where each graph id is served from, decided once. */
+  private readonly targets = new Map<string, Promise<OpenTarget>>();
   private readonly log: (line: string) => void;
 
   constructor(private readonly opts: ServerOptions) {
     if (opts.driver === 'sqlite' && !opts.sqliteDir) throw new UsageError('--sqlite-dir <dir> is required with --driver sqlite');
     if (opts.driver === 'postgres' && !opts.pg) throw new UsageError('--pg <connectionString> is required with --driver postgres');
+    if (opts.migrateFromPg && opts.driver !== 'sqlite') throw new UsageError('--migrate-from-pg moves graphs to SQLite; it needs --driver sqlite');
     this.log = opts.log ?? (() => {});
     this.http = createServer((req, res) => {
       this.handle(req, res).catch((err: unknown) => {
@@ -173,11 +191,44 @@ export class GraphServer {
     const key = `${graphId}${KEY_SEP}${createHash('sha256').update(canonical(spec ?? null)).digest('hex')}`;
     let g = this.graphs.get(key);
     if (!g) {
-      g = openGraph(this.target(graphId), { privileged: true, embedding: embeddingFrom(spec), log: (line) => this.log(`${graphId}: ${line}`) });
+      g = this.openTarget(graphId).then((target) =>
+        openGraph(target, { privileged: true, embedding: embeddingFrom(spec), log: (line) => this.log(`${graphId}: ${line}`) }));
       this.graphs.set(key, g);
       g.catch(() => this.graphs.delete(key));
     }
     return g;
+  }
+
+  /** Where `graphId` is served from. Without --migrate-from-pg, its target.
+   *  With it, decided on the first open and kept: the SQLite file (copied from
+   *  Postgres first when it does not exist yet), or — only when that copy
+   *  failed — the graph's Postgres schema, so it is never served empty. */
+  private openTarget(graphId: string): Promise<OpenTarget> {
+    if (!this.opts.migrateFromPg) return Promise.resolve(this.target(graphId));
+    let t = this.targets.get(graphId);
+    if (!t) {
+      t = this.migrateOnFirstOpen(graphId, this.opts.migrateFromPg);
+      this.targets.set(graphId, t);
+    }
+    return t;
+  }
+
+  private async migrateOnFirstOpen(graphId: string, pg: string): Promise<OpenTarget> {
+    const file = this.target(graphId) as string;
+    if (existsSync(file)) return file;
+    const schema = schemaFor(graphId);
+    try {
+      // Not under the first caller's signal: a caller that gives up must not
+      // cut the move short (every later request waits for this same move).
+      const r = await withSignal(new AbortController().signal, () => migrateSchemaToSqlite(pg, schema, file));
+      if (r.status === 'migrated') {
+        this.log(`${graphId}: moved from Postgres schema ${schema} to SQLite in ${r.ms}ms — row counts verified ${JSON.stringify(r.counts)}; the schema is left as it was`);
+      }
+      return file;
+    } catch (err) {
+      this.log(`${graphId}: MIGRATION FAILED from Postgres schema ${schema}: ${(err as Error).message} — serving this graph from its Postgres data until the next start, when the move is tried again; the schema is untouched`);
+      return { driver: 'postgres', connectionString: pg, schema };
+    }
   }
 
   private authorized(req: IncomingMessage): boolean {
@@ -263,7 +314,16 @@ export class GraphServer {
       this.graphs.delete(key);
       await g.then((graph) => graph.close()).catch(() => {});
     }
+    const pending = this.targets.get(graphId);
+    if (pending) await pending.catch(() => undefined);
     await dropGraph(this.target(graphId));
+    if (this.opts.migrateFromPg) {
+      // An empty file that names the schema as taken over: the dropped graph
+      // must not come back from its Postgres copy on the next open.
+      const file = this.target(graphId) as string;
+      await markDropped(file, schemaFor(graphId));
+      this.targets.set(graphId, Promise.resolve(file));
+    }
     return { dropped: true, graphId };
   }
 
@@ -335,6 +395,8 @@ export interface ServerArgs extends ServerOptions {
   port: number;
   host: string;
   help: boolean;
+  /** Print the legacy schemas not yet moved (JSON) and exit. */
+  listUnmigrated?: boolean;
 }
 
 export function parseServerArgs(argv: string[]): ServerArgs {
@@ -359,6 +421,8 @@ export function parseServerArgs(argv: string[]): ServerArgs {
       }
       case '--sqlite-dir': out.sqliteDir = value(); break;
       case '--pg': out.pg = value(); break;
+      case '--migrate-from-pg': out.migrateFromPg = value(); break;
+      case '--list-unmigrated': out.listUnmigrated = true; break;
       case '--port': {
         const p = Number(value());
         if (!Number.isInteger(p) || p < 0 || p > 65535) throw new UsageError('--port must be an integer 0..65535');
@@ -381,6 +445,10 @@ export function usage(): string {
     'Usage:',
     '  agent-graph-server --driver sqlite   --sqlite-dir <dir> [--port 8787] [--host 127.0.0.1] [--auth-token <t>]',
     '  agent-graph-server --driver postgres --pg <connectionString> [--port 8787] [--host 127.0.0.1] [--auth-token <t>]',
+    '  agent-graph-server --driver sqlite --sqlite-dir <dir> --migrate-from-pg <connectionString> [--list-unmigrated] [...]',
+    '',
+    'With --migrate-from-pg, a graph with no file yet is copied from its Postgres schema on first open (verified; the schema is left untouched).',
+    '--list-unmigrated prints the Postgres schemas still holding rows no file has taken over, as JSON, and exits.',
     '',
     'Routes:',
     '  GET  /health          { ok, driver, version }',
@@ -397,6 +465,11 @@ export async function main(argv: string[]): Promise<void> {
   const args = parseServerArgs(argv);
   if (args.help) {
     process.stdout.write(usage() + '\n');
+    return;
+  }
+  if (args.listUnmigrated) {
+    if (!args.migrateFromPg || !args.sqliteDir) throw new UsageError('--list-unmigrated needs --migrate-from-pg and --sqlite-dir');
+    process.stdout.write(JSON.stringify(await unmigratedSchemas(args.migrateFromPg, args.sqliteDir)) + '\n');
     return;
   }
   const log = (line: string) => process.stderr.write(`[agent-graph-server] ${line}\n`);

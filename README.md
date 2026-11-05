@@ -184,6 +184,10 @@ const g = await openGraph(
 
 The schema DDL and every write statement have one definition (`schema.ts`); `renderSql(sql, dialect)` is exported so a host applying `journalToSql` output to its own database can render for either engine. A dump taken on one engine loads on the other — epochs are numbers, JSON is text, booleans are 0/1 on both, and Postgres text columns use `COLLATE "C"` so `ORDER BY id` agrees with SQLite's byte order.
 
+### Moving a server from Postgres to SQLite
+
+`agent-graph-server --driver sqlite --sqlite-dir <dir> --migrate-from-pg <connectionString>` keeps a Postgres-backed server's data when it switches drivers. A graph with no file yet is copied from the schema the same graph id used (`schemaFor`, including ids shortened with a hash) the first time it is opened: every table, vectors included (re-encoded as int8 from each row's own dims), read in one read-only snapshot, written to `<file>.migrating`, row counts compared table by table, then renamed into place. The Postgres schema is never changed. If the copy fails, that graph is served from Postgres until the next start and the log says `MIGRATION FAILED`. `--list-unmigrated` prints the schemas that still hold rows no file has taken over (JSON) and exits — when it prints `[]`, the Postgres server is no longer needed. `dump()`/`load()` are not used for this: a dump leaves the vectors out, and `load()` re-runs today's content guards over old rows.
+
 ## Embeddings: you decide what gets embedded
 
 Off by default. Turn it on by giving the graph a model:
